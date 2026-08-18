@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm ci --omit=dev
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health
     autoDeploy: true

@@ -6,10 +6,10 @@ const {
   REQUEST_TIMEOUT_MS,
   CACHE_TTL_MS,
   FILE_TYPE_MAP,
+  VIDEO_FILE_TYPE_FALLBACKS,
   AUDIO_BITRATE_KBPS,
 } = require("../config/constants");
 
-// ---------- Error taxonomy ----------
 class ScraperError extends Error {
   constructor(message, statusCode = 502) {
     super(message);
@@ -28,13 +28,15 @@ class ConversionTimeoutError extends Error {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ---------- Cache (TTL + in-flight dedupe) ----------
-const resultCache = new Map(); // key -> { value, expiresAt }
-const inflight = new Map();    // key -> Promise (dedupes concurrent calls)
+const resultCache = new Map();
+const inflight = new Map();
+// type -> fileType string that actually worked (discovered at runtime)
+const fileTypeWinner = new Map();
 
 function resolveFileType(type, quality) {
   if (type === "audio") return FILE_TYPE_MAP.audio;
-  return FILE_TYPE_MAP.video[quality];
+  // Prefer a previously discovered working value
+  return fileTypeWinner.get("video") || FILE_TYPE_MAP.video[quality];
 }
 
 function browserHeaders() {
@@ -51,10 +53,51 @@ function browserHeaders() {
 }
 
 /**
- * Core scraper. POSTs {id, fileType} to the converter and polls
- * for a success status. Retries on network errors, non-200s,
- * timeouts, and "pending" statuses.
+ * One-shot probe: POSTs a single fileType and returns true only if the
+ * converter answers with a success status AND a usable download link.
  */
+async function probeFileType(videoId, fileType, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(CONVERTER_URL, {
+      method: "POST",
+      headers: browserHeaders(),
+      body: JSON.stringify({ id: videoId, fileType }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const json = await response.json();
+    return (json.status === "ok" || json.status === "success") && Boolean(json.link);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Finds the first fileType the converter accepts for this video.
+ * One fast attempt per candidate; result is cached for the process lifetime.
+ */
+async function discoverWorkingFileType(videoId) {
+  const winner = fileTypeWinner.get("video");
+  if (winner) return winner;
+
+  for (const candidate of VIDEO_FILE_TYPE_FALLBACKS) {
+    // Skip if it's already the configured default (already failed upstream)
+    if (candidate === FILE_TYPE_MAP.video["720"]) continue;
+    console.log(`[probe] trying fileType "${candidate}" for ${videoId}...`);
+    // eslint-disable-next-line no-await-in-loop
+    if (await probeFileType(videoId, candidate)) {
+      console.log(`[probe] fileType "${candidate}" works — caching`);
+      fileTypeWinner.set("video", candidate);
+      return candidate;
+    }
+  }
+  return null;
+}
+
 async function downloadFromYtmp4(videoId, type, quality, opts = {}) {
   const fileType = resolveFileType(type, quality);
   const body = JSON.stringify({ id: videoId, fileType });
@@ -78,10 +121,7 @@ async function downloadFromYtmp4(videoId, type, quality, opts = {}) {
       });
 
       if (!response.ok) {
-        throw new ScraperError(
-          `Converter responded with HTTP ${response.status}`,
-          response.status >= 500 ? 502 : 502
-        );
+        throw new ScraperError(`Converter responded with HTTP ${response.status}`);
       }
 
       let json;
@@ -108,10 +148,8 @@ async function downloadFromYtmp4(videoId, type, quality, opts = {}) {
         };
       }
 
-      // status is still "pending" — keep polling
       lastError = new ScraperError(`Conversion pending (attempt ${attempt + 1}/${maxRetries})`);
     } catch (err) {
-      // AbortError = our own timeout; keep everything retryable
       lastError = err;
       if (attempt === maxRetries - 1) break;
     } finally {
@@ -127,9 +165,6 @@ async function downloadFromYtmp4(videoId, type, quality, opts = {}) {
   throw lastError || new ScraperError("Unknown converter failure");
 }
 
-/**
- * Public entry point: TTL cache + in-flight dedupe around the scraper.
- */
 async function getDownload(videoId, type, quality) {
   const key = `${type}:${quality}:${videoId}`;
 
@@ -138,16 +173,27 @@ async function getDownload(videoId, type, quality) {
     return { ...cached.value, servedFromCache: true };
   }
 
-  // Reuse an in-flight request so N concurrent clients don't
-  // trigger N converter polls.
   if (inflight.has(key)) return inflight.get(key);
 
-  const promise = downloadFromYtmp4(videoId, type, quality)
-    .then((value) => {
-      resultCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
-      return { ...value, servedFromCache: false };
-    })
-    .finally(() => inflight.delete(key));
+  const promise = (async () => {
+    try {
+      return await downloadFromYtmp4(videoId, type, quality);
+    } catch (err) {
+      // Video only: the configured fileType failed — discover one that works
+      if (type === "video" && fileTypeWinner.get("video") === undefined) {
+        const working = await discoverWorkingFileType(videoId);
+        if (working) {
+          const result = await downloadFromYtmp4(videoId, type, quality);
+          result.fileTypeUsed = working;
+          return result;
+        }
+      }
+      throw err;
+    }
+  })().then((value) => {
+    resultCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+    return { ...value, servedFromCache: false };
+  }).finally(() => inflight.delete(key));
 
   inflight.set(key, promise);
   return promise;
